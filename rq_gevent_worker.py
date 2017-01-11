@@ -1,176 +1,170 @@
-# -*- coding: utf-8 -*-
-from __future__ import (absolute_import, division, print_function,
-                        unicode_literals)
+import gevent.monkey
 
-from gevent import monkey, get_hub
-from gevent.hub import LoopExit
-monkey.patch_all()
+gevent.monkey.patch_all()
 
-import signal
-import gevent
-import gevent.pool
-from rq import Worker
-try: # for rq >= 0.5.0
-    from rq.job import JobStatus
-except ImportError: # for rq <= 0.4.6 
-    from rq.job import Status as JobStatus
-from rq.timeouts import BaseDeathPenalty, JobTimeoutException
-from rq.worker import StopRequested, green, blue
-from rq.exceptions import DequeueTimeout
-from rq.logutils import setup_loghandlers
-from rq.version import VERSION
+import socket
+import logging
+import json
+from io import BytesIO
+from functools import partial
+from collections import defaultdict
 
+import kafka
 
-class GeventDeathPenalty(BaseDeathPenalty):
-    def setup_death_penalty(self):
-        exception = JobTimeoutException('Gevent Job exceeded maximum timeout value (%d seconds).' % self._timeout)
-        self.gevent_timeout = gevent.Timeout(self._timeout, exception)
-        self.gevent_timeout.start()
+from utils import tarlib, event_loop
+from utils.log import setup_logging
+from core.ffan.helpers import fetch_ffan_macs
+from core import resolver
+from core import protocol
+from core import zhongke
+from core import ffan
+from conf import config
 
-    def cancel_death_penalty(self):
-        self.gevent_timeout.cancel()
+setup_logging()
+
+log = logging.getLogger(__name__)
+
+MAX_FETCH_SIZE = 64 * 1024 * 1024
 
 
-class GeventWorker(Worker):
-    death_penalty_class = GeventDeathPenalty
+def fetch_sniffer(consumer, sniffer_map, sniffer_map_zk, sniffer_map_ff):
+    offset_messages = consumer.get_messages(count=300, timeout=0.2)
 
-    def __init__(self, *args, **kwargs):
-        pool_size = 20
-        if 'pool_size' in kwargs:
-            pool_size = kwargs.pop('pool_size')
-        self.gevent_pool = gevent.pool.Pool(pool_size)
-        super(GeventWorker, self).__init__(*args, **kwargs)
-
-    def register_birth(self):
-        super(GeventWorker, self).register_birth()
-        self.connection.hset(self.key, 'pool_size', self.gevent_pool.size)
-
-    def heartbeat(self, timeout=0, pipeline=None):
-        connection = pipeline if pipeline is not None else self.connection
-        super(GeventWorker, self).heartbeat(timeout)
-        connection.hset(self.key, 'curr_pool_len', len(self.gevent_pool))
-
-    def _install_signal_handlers(self):
-        def request_force_stop():
-            self.log.warning('Cold shut down.')
-            self.gevent_pool.kill()
-            raise SystemExit()
-
-        def request_stop():
-            if not self._stopped:
-                gevent.signal(signal.SIGINT, request_force_stop)
-                gevent.signal(signal.SIGTERM, request_force_stop)
-
-                self.log.warning('Warm shut down requested.')
-                self.log.warning('Stopping after all greenlets are finished. '
-                                 'Press Ctrl+C again for a cold shutdown.')
-
-                self._stopped = True
-                self.gevent_pool.join()
-
-            raise StopRequested()
-
-        gevent.signal(signal.SIGINT, request_stop)
-        gevent.signal(signal.SIGTERM, request_stop)
-
-    def set_current_job_id(self, job_id, pipeline=None):
-        pass
-
-    def work(self, burst=False):
-        """Starts the work loop.
-
-        Pops and performs all jobs on the current list of queues.  When all
-        queues are empty, block and wait for new jobs to arrive on any of the
-        queues, unless `burst` mode is enabled.
-
-        The return value indicates whether any jobs were processed.
-        """
-        setup_loghandlers()
-        self._install_signal_handlers()
-
-        self.did_perform_work = False
-        self.register_birth()
-        self.log.info('RQ worker started, version %s' % VERSION)
-        self.set_state('starting')
+    for om in offset_messages:
         try:
-            while True:
-                if self.stopped:
-                    self.log.info('Stopping on request.')
-                    break
+            device_mac, file_name, data = om.message.value.split('+', 2)
+        except ValueError:
+            continue
 
-                timeout = None if burst else max(1, self.default_worker_ttl - 60)
-                try:
-                    result = self.dequeue_job_and_maintain_ttl(timeout)
-
-                    if result is None and burst:
-                        try:
-                            # Make sure dependented jobs are enqueued.
-                            get_hub().switch()
-                        except LoopExit:
-                            pass
-                        result = self.dequeue_job_and_maintain_ttl(timeout)
-
-                    if result is None:
-                        break
-                except StopRequested:
-                    break
-
-                job, queue = result
-                self.execute_job(job, queue)
-
-        finally:
-            if not self.is_horse:
-                self.register_death()
-        return self.did_perform_work
-
-    def execute_job(self, job, queue):
-        def job_done(child):
-            self.did_perform_work = True
-            self.heartbeat()
-            if job.get_status() == JobStatus.FINISHED:
-                queue.enqueue_dependents(job)
-
-        child_greenlet = self.gevent_pool.spawn(self.perform_job, job)
-        child_greenlet.link(job_done)
-
-    def dequeue_job_and_maintain_ttl(self, timeout):
-        if self._stopped:
-            raise StopRequested()
-
-        result = None
-        while True:
-            if self._stopped:
-                raise StopRequested()
-
-            self.heartbeat()
-
-            while self.gevent_pool.full():
-                gevent.sleep(0.1)
-                if self._stopped:
-                    raise StopRequested()
-
+        if device_mac in config.MACS:
             try:
-                result = self.queue_class.dequeue_any(self.queues, timeout, connection=self.connection)
-                if result is not None:
-                    job, queue = result
-                    self.log.info('%s: %s (%s)' % (green(queue.name),
-                                  blue(job.description), job.id))
-                break
-            except DequeueTimeout:
-                pass
+                archive = tarlib.extract_to_memory(file_obj=BytesIO(data))
+            except tarlib.Error:
+                log.warn('Fail to extract file %s', file_name)
+                continue
 
-        self.heartbeat()
-        return result
+            data_map = resolver.resolve(device_mac, archive)
+            if not data_map:
+                continue
+            for data_type, seq in data_map.iteritems():
+                sniffer_map[data_type] += '\n'.join('\t'.join(x) for x in seq) + '\n'
+
+        if device_mac in config.ZHONGKE_MACS:
+            try:
+                archive = tarlib.extract_to_memory(file_obj=BytesIO(data))
+            except tarlib.Error:
+                log.warn('Fail to extract file %s', file_name)
+                continue
+
+            data_list = zhongke.resolver.resolve(device_mac, archive)
+            if not data_list:
+                continue
+
+            sniffer_map_zk["snza"] += "\n".join(
+                [json.dumps({"data": msg, "packType": 1}) for msg in data_list]) + "\n"
+
+        if device_mac in config.GTBH_MACS:
+            try:
+                archive = tarlib.extract_to_memory(file_obj=BytesIO(data))
+            except tarlib.Error:
+                log.warn('Fail to extract file %s', file_name)
+                continue
+
+            data_list = zhongke.resolver.resolve(device_mac, archive, 113617)
+            if not data_list:
+                continue
+
+            sniffer_map_zk["gtbh"] += "\n".join(
+                [json.dumps({"data": msg, "packType": 1}) for msg in data_list]) + "\n"
+
+        if device_mac in config.BJFK_MACS:
+            try:
+                archive = tarlib.extract_to_memory(file_obj=BytesIO(data))
+            except tarlib.Error:
+                log.warn('Fail to extract file %s', file_name)
+                continue
+
+            data_list = zhongke.resolver.resolve(device_mac, archive, 120746)
+            if not data_list:
+                continue
+
+            sniffer_map_zk["bjfk"] += "\n".join(
+                [json.dumps({"data": msg, "packType": 1}) for msg in data_list]) + "\n"
+
+        if device_mac in fetch_ffan_macs():
+            try:
+                archive = tarlib.extract_to_memory(file_obj=BytesIO(data))
+            except tarlib.Error:
+                log.warn('Fail to extract file %s', file_name)
+                continue
+
+            data_map = ffan.resolver.resolve(device_mac, archive)
+            if not data_map:
+                continue
+            for data_type, data_list in data_map.iteritems():
+                sniffer_map_ff[data_type].extend(data_list)
 
 
-def main():
-    import sys
-    from rq.scripts.rqworker import main as rq_main
+def commit_sniffer(sniffer_map):
+    if not sniffer_map:
+        return
+    file_name, content = protocol.pack(sniffer_map)
+    try:
+        protocol.send_file(file_name, content,
+                           **config.XDES['FTP'])
+    except KeyError as ex:
+        log.warn('No configuration for %s - %s', 'FTP', ex.message)
+    except socket.error as ex:
+        log.warn('Fail to send file - %s', ex)
+    finally:
+        sniffer_map.clear()
 
-    if '-w' in sys.argv or '--worker-class' in sys.argv:
-        print("You cannot specify worker class when using this script,"
-                "use the official rqworker instead")
-        sys.exit(1)
 
-    sys.argv.extend(['-w', 'rq_gevent_worker.GeventWorker'])
-    rq_main()
+def commit_sniffer_zk(sniffer_map_zk):
+    try:
+        zhongke.protocol.send(sniffer_map_zk)
+    finally:
+        sniffer_map_zk.clear()
+
+
+def commit_sniffer_ff(sniffer_map_ff):
+    try:
+        ffan.protocol.pack(sniffer_map_ff)
+    finally:
+        sniffer_map_ff.clear()
+
+
+def cycle():
+    client = kafka.KafkaClient(hosts=config.KAFKA_HOSTS)
+    consumer = kafka.SimpleConsumer(client,
+                                    group=config.KAFKA_GROUP,
+                                    topic=config.KAFKA_TOPIC,
+                                    fetch_size_bytes=64 * 1024,
+                                    buffer_size=256 * 1024,
+                                    max_buffer_size=MAX_FETCH_SIZE)
+
+    loop = event_loop.Loop()
+    sniffer_map = defaultdict(str)
+    sniffer_map_zk = defaultdict(str)
+    sniffer_map_ff = defaultdict(list)
+
+    loop.add_callback(partial(fetch_sniffer, consumer, sniffer_map, sniffer_map_zk, sniffer_map_ff))
+    # Commit every 5 seconds
+    event_loop.PeriodicCallback(
+        partial(commit_sniffer, sniffer_map), 5 * 1000, loop=loop
+    ).start()
+
+    event_loop.PeriodicCallback(
+        partial(commit_sniffer_zk, sniffer_map_zk), 5 * 1000, loop=loop
+    ).start()
+
+    event_loop.PeriodicCallback(
+        partial(commit_sniffer_ff, sniffer_map_ff), 30 * 1000, loop=loop
+    ).start()
+
+    log.warn('start main loop...')
+    loop.start()
+
+
+if __name__ == '__main__':
+    cycle()
